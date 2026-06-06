@@ -5,6 +5,9 @@ import mediapipe as mp
 import numpy as np
 import time
 import collections
+import os
+import csv
+from datetime import datetime
 
 # --- ASSET LOADING ---
 def load_assets():
@@ -21,16 +24,29 @@ def load_assets():
 ASSETS = load_assets()
 
 class TaiyakiGuardTransformer(VideoTransformerBase):
-    def __init__(self):
+    def __init__(self, picker_type="skin picking", tracking_enabled=False, user_id=""):
         # Initialize MediaPipe
         self.mp_face = mp.solutions.face_detection.FaceDetection(min_detection_confidence=0.5)
         self.mp_hands = mp.solutions.hands.Hands(min_detection_confidence=0.5)
-        
+
+        # Config
+        self.picker_type = picker_type
+        self.tracking_enabled = tracking_enabled
+        self.user_id = user_id or "anonymous"
+
         # State tracking
         self.finger_history = collections.deque(maxlen=180)
         self.continuous_touch_start = None
         self.alert_until = 0
         self.TIP_IDS = [4, 8, 12, 16, 20] # Fingertips
+        self.last_logged_alert = 0
+        self.data_dir = "data"
+        self.log_file = os.path.join(self.data_dir, "picking_log.csv")
+        if self.tracking_enabled and not os.path.exists(self.data_dir):
+            try:
+                os.makedirs(self.data_dir, exist_ok=True)
+            except Exception:
+                pass
 
     def is_active_motion(self, history, current_time):
         recent = [e for e in history if current_time - e[0] <= 6.0]
@@ -103,6 +119,14 @@ class TaiyakiGuardTransformer(VideoTransformerBase):
         duration = current_time - self.continuous_touch_start if self.continuous_touch_start else 0
         
         if duration >= 5.0 and motion:
+            # Trigger alert
+            if current_time >= self.alert_until:
+                # only log when new alert occurs
+                if self.tracking_enabled:
+                    try:
+                        self.log_event(event_type="alert", duration=duration, motion=motion)
+                    except Exception:
+                        pass
             self.alert_until = current_time + 3.0
 
         # Rendering
@@ -123,11 +147,37 @@ class TaiyakiGuardTransformer(VideoTransformerBase):
         
         return img
 
+    def log_event(self, event_type, duration, motion):
+        # Append a CSV row with timestamp, picker type, user id, event, duration, motion
+        if not self.tracking_enabled:
+            return
+        header = ["timestamp", "user_id", "picker_type", "event", "duration_s", "motion"]
+        row = [datetime.utcnow().isoformat(), self.user_id, self.picker_type, event_type, f"{duration:.2f}", str(bool(motion))]
+        write_header = not os.path.exists(self.log_file)
+        with open(self.log_file, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(header)
+            w.writerow(row)
+
 # --- STREAMLIT PAGE CONFIG ---
 st.set_page_config(page_title="Taiyaki Guard", page_icon="🐟")
 st.title("🐟 Taiyaki Guard")
 st.markdown("### Protect your skin with computer vision.")
 
-webrtc_streamer(key="taiyaki", video_transformer_factory=TaiyakiGuardTransformer)
+# --- UI: Picker type + Tracking consent ---
+picker_options = ["skin picking", "nail biting", "hair picking", "lip picking", "other"]
+picker_choice = st.sidebar.selectbox("Choose picking type:", picker_options)
+track_choice = st.sidebar.radio("Allow anonymous tracking to understand your picking?", ("No", "Yes"))
+tracking_enabled = True if track_choice == "Yes" else False
+user_id = st.sidebar.text_input("Optional user id (or leave blank for anonymous)")
+
+if tracking_enabled:
+    st.sidebar.success("Tracking enabled — events will be saved locally to data/picking_log.csv")
+else:
+    st.sidebar.info("Tracking disabled — no data will be saved")
+
+# Start camera with transformer configured by UI
+webrtc_streamer(key="taiyaki", video_transformer_factory=lambda: TaiyakiGuardTransformer(picker_type=picker_choice, tracking_enabled=tracking_enabled, user_id=user_id))
 
 st.sidebar.info("This app monitors for repetitive face-touching. If detected for 5 seconds, Taiyaki will intervene!")
